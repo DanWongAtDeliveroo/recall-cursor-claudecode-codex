@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Search past Claude Code and Codex sessions using FTS5 full-text search."""
+"""Search past Claude Code, Codex, and Cursor sessions using FTS5 full-text search."""
 
 import argparse
 import json
@@ -15,9 +15,11 @@ from pathlib import Path
 
 CLAUDE_DIR = Path.home() / ".claude"
 CODEX_DIR = Path.home() / ".codex"
+CURSOR_DIR = Path.home() / ".cursor"
 DB_PATH = Path.home() / ".recall.db"
 CLAUDE_PROJECTS_DIR = CLAUDE_DIR / "projects"
 CODEX_SESSIONS_DIR = CODEX_DIR / "sessions"
+CURSOR_PROJECTS_DIR = CURSOR_DIR / "projects"
 
 
 def create_schema(conn):
@@ -69,6 +71,7 @@ def migrate_db_location():
 
 TEXT_BLOCK_TYPES = {"text", "input_text", "output_text"}
 CODEX_SKIP_MARKERS = ("<user_instructions>", "<environment_context>", "<permissions instructions>", "# AGENTS.md instructions")
+CURSOR_SKIP_MARKERS = ("<user_info>", "<system_reminder>", "<agent_transcripts>", "<rules>", "<agent_skills>")
 
 
 def extract_text(content):
@@ -311,6 +314,120 @@ def parse_codex_session(path):
     return metadata, messages
 
 
+# — Cursor session parser ——————————————————————————————————————————————————
+
+def slug_to_path(slug):
+    """Convert a Cursor project directory slug back to a filesystem path.
+
+    Cursor encodes workspace paths as directory names by replacing both path
+    separators and spaces with hyphens: /Users/dan/my project -> Users-dan-my-project.
+    We resolve the ambiguity by trying the longest matching segment at each
+    position, checking for hyphens, spaces, and slashes.
+    """
+    parts = slug.split("-")
+    path = ""
+    i = 0
+    while i < len(parts):
+        best_j = i
+        found = False
+        for j in range(len(parts) - 1, i, -1):
+            for sep in ("-", " "):
+                candidate = path + "/" + sep.join(parts[i:j + 1])
+                if os.path.exists(candidate):
+                    best_j = j
+                    found = True
+                    break
+            if found:
+                break
+
+        if found:
+            # Reconstruct with the separator that matched
+            for sep in ("-", " "):
+                candidate = path + "/" + sep.join(parts[i:best_j + 1])
+                if os.path.exists(candidate):
+                    path = candidate
+                    break
+        else:
+            path = path + "/" + parts[i]
+        i = best_j + 1
+    return path
+
+
+def parse_cursor_session(path):
+    """Parse a Cursor JSONL session file, returning (metadata, messages).
+
+    Cursor sessions live in ~/.cursor/projects/<slug>/agent-transcripts/<uuid>/<uuid>.jsonl.
+    Entries have the format: {"role": "user"|"assistant", "message": {"content": [...]}}
+    No per-entry timestamps — we use file mtime instead.
+    """
+    fpath = Path(path)
+    session_id = fpath.parent.name  # UUID directory name
+    messages = []
+
+    # Derive project from the directory structure:
+    # .cursor/projects/<slug>/agent-transcripts/<uuid>/<uuid>.jsonl
+    try:
+        transcript_dir = fpath.parent.parent          # agent-transcripts/
+        project_slug_dir = transcript_dir.parent      # <slug>/
+        project_slug = project_slug_dir.name
+        project = slug_to_path(project_slug)
+    except (IndexError, AttributeError):
+        project_slug = ""
+        project = ""
+
+    try:
+        mtime = os.path.getmtime(path)
+        timestamp = int(mtime * 1000)
+    except OSError:
+        timestamp = 0
+
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                role = entry.get("role", "")
+                if role not in ("user", "assistant"):
+                    continue
+
+                content = entry.get("message", {})
+                if isinstance(content, dict):
+                    content = content.get("content", "")
+                elif not isinstance(content, str):
+                    continue
+
+                text = extract_text(content)
+                if not text:
+                    continue
+                if any(marker in text for marker in CURSOR_SKIP_MARKERS):
+                    continue
+
+                messages.append((role, text))
+
+    except (OSError, PermissionError) as e:
+        print(f"Warning: skipping {path}: {e}", file=sys.stderr)
+        return None
+
+    date_str = time.strftime("%Y-%m-%d", time.localtime(mtime)) if timestamp else ""
+    slug = f"{date_str}-{session_id[:8]}" if date_str else session_id[:12]
+
+    metadata = {
+        "session_id": session_id,
+        "source": "cursor",
+        "file_path": path,
+        "project": project,
+        "slug": slug,
+        "timestamp": timestamp,
+    }
+    return metadata, messages
+
+
 # — Indexing ———————————————————————————————————————————————————————————————
 
 def index_sessions(conn, force=False):
@@ -329,7 +446,7 @@ def index_sessions(conn, force=False):
     except sqlite3.OperationalError:
         pass
 
-    # Collect files from both sources
+    # Collect files from all sources
     sources = []
 
     # Claude Code: ~/.claude/projects/**/*.jsonl
@@ -341,6 +458,11 @@ def index_sessions(conn, force=False):
     codex_pattern = str(CODEX_SESSIONS_DIR / "**" / "*.jsonl")
     for fpath in glob(codex_pattern, recursive=True):
         sources.append((fpath, "codex"))
+
+    # Cursor: ~/.cursor/projects/*/agent-transcripts/*/*.jsonl
+    cursor_pattern = str(CURSOR_PROJECTS_DIR / "*" / "agent-transcripts" / "*" / "*.jsonl")
+    for fpath in glob(cursor_pattern):
+        sources.append((fpath, "cursor"))
 
     indexed = 0
     skipped = 0
@@ -366,8 +488,10 @@ def index_sessions(conn, force=False):
 
         if source == "claude":
             result = parse_claude_session(fpath)
-        else:
+        elif source == "codex":
             result = parse_codex_session(fpath)
+        else:
+            result = parse_cursor_session(fpath)
 
         if result is None:
             continue
@@ -500,11 +624,11 @@ def format_timestamp(ts_ms):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Search past Claude Code and Codex sessions")
+    parser = argparse.ArgumentParser(description="Search past Claude Code, Codex, and Cursor sessions")
     parser.add_argument("query", help="Search query (FTS5 syntax: quotes for phrases, AND/OR/NOT)")
     parser.add_argument("--project", help="Filter to sessions from a specific project path (prefix match)")
     parser.add_argument("--days", type=int, help="Only sessions from last N days")
-    parser.add_argument("--source", choices=["claude", "codex"], help="Filter by source (claude or codex)")
+    parser.add_argument("--source", choices=["claude", "codex", "cursor"], help="Filter by source")
     parser.add_argument("--limit", type=int, default=10, help="Max results (default: 10)")
     parser.add_argument("--reindex", action="store_true", help="Force full rebuild of the index")
 

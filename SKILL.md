@@ -1,23 +1,23 @@
 ---
-name: recall
+name: recall-cursor-claudecode-codex
 description: >
-  Search past Claude Code and Codex sessions. Triggers: /recall, "search old conversations",
+  Search past Cursor, Claude Code, and Codex sessions. Triggers: /recall, "search old conversations",
   "find a past session", "recall a previous conversation", "search session history",
-  "what did we discuss", "remember when we"
+  "what did we discuss", "remember when we", "search Cursor sessions"
 metadata:
-  author: arjunkmrm
-  version: "0.2.2"
+  author: DanWongAtDeliveroo
+  version: "0.3.0"
   license: MIT
 ---
 
-# /recall — Search Past Claude & Codex Sessions
+# /recall — Search Past Cursor, Claude Code & Codex Sessions
 
-Search all past Claude Code and Codex sessions using full-text search with BM25 ranking.
+Search all past Cursor, Claude Code, and Codex sessions using full-text search with BM25 ranking.
 
 ## Usage
 
 ```bash
-python3 ~/.claude/skills/recall/scripts/recall.py QUERY [--project PATH] [--days N] [--source claude|codex] [--limit N] [--reindex]
+python3 ~/.claude/skills/recall/scripts/recall.py QUERY [--project PATH] [--days N] [--source claude|codex|cursor] [--limit N] [--reindex]
 ```
 
 ## Examples
@@ -44,6 +44,9 @@ python3 ~/.claude/skills/recall/scripts/recall.py "buffer" --source claude
 # Search only Codex sessions
 python3 ~/.claude/skills/recall/scripts/recall.py "buffer" --source codex
 
+# Search only Cursor sessions
+python3 ~/.claude/skills/recall/scripts/recall.py "sandbox" --source cursor
+
 # Force reindex
 python3 ~/.claude/skills/recall/scripts/recall.py --reindex "test"
 ```
@@ -68,6 +71,10 @@ claude --resume SESSION_ID
 # Codex sessions [codex]
 cd /path/to/project
 codex resume SESSION_ID
+
+# Cursor sessions [cursor]
+# Cursor doesn't support CLI resume — open the project in Cursor
+# and use the transcript file path to review the conversation.
 ```
 
 Each result includes a `File:` path. Use it to read the raw transcript (auto-detects format):
@@ -81,7 +88,8 @@ If results are missing `File:` paths, run `--reindex` to backfill.
 ## Notes
 
 - Index is stored at `~/.recall.db` (SQLite FTS5, auto-migrated from `~/.claude/recall.db`)
-- Indexes both `~/.claude/projects/` (Claude Code) and `~/.codex/sessions/` (Codex)
+- Indexes `~/.claude/projects/` (Claude Code), `~/.codex/sessions/` (Codex), and `~/.cursor/projects/` (Cursor)
 - First run indexes all sessions (a few seconds); subsequent runs are incremental
 - Only user and assistant messages are indexed (tool calls, thinking blocks, state snapshots skipped)
-- Results show `[claude]` or `[codex]` tags to indicate the source
+- Results show `[claude]`, `[codex]`, or `[cursor]` tags to indicate the source
+- Cursor sessions derive timestamps from file modification time (no per-entry timestamps)

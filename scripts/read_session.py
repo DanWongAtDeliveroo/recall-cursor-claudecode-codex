@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pretty-print a Claude Code or Codex session transcript."""
+"""Pretty-print a Claude Code, Codex, or Cursor session transcript."""
 
 import json
 import sys
@@ -9,6 +9,11 @@ TEXT_BLOCK_TYPES = {"text", "input_text", "output_text"}
 SKIP_MARKERS = (
     "<user_instructions>", "<environment_context>",
     "<permissions instructions>", "# AGENTS.md instructions",
+)
+
+CURSOR_SKIP_MARKERS = (
+    "<user_info>", "<system_reminder>", "<agent_transcripts>",
+    "<rules>", "<agent_skills>",
 )
 
 
@@ -44,7 +49,21 @@ def iter_messages(path):
             if entry.get("record_type") == "state":
                 continue
 
-            if fmt == "claude":
+            if fmt == "cursor":
+                role = entry.get("role", "")
+                if role not in ("user", "assistant"):
+                    continue
+                content = entry.get("message", {})
+                if isinstance(content, dict):
+                    content = content.get("content", "")
+                elif not isinstance(content, str):
+                    continue
+                text = extract_text(content)
+                if not text or any(marker in text for marker in CURSOR_SKIP_MARKERS):
+                    continue
+                yield role, text
+
+            elif fmt == "claude":
                 # Resolve role from type or role fields
                 role = entry.get("role", "")
                 if role not in ("user", "assistant"):
@@ -62,6 +81,11 @@ def iter_messages(path):
                     content = content.get("content", "")
                 elif not isinstance(content, str):
                     content = entry.get("content", "")
+
+                text = extract_text(content)
+                if not text or any(marker in text for marker in SKIP_MARKERS):
+                    continue
+                yield role, text
 
             else:
                 # Codex — handle both legacy and current (wrapped payload) formats
@@ -81,15 +105,17 @@ def iter_messages(path):
                 if role not in ("user", "assistant"):
                     continue
 
-            text = extract_text(content)
-            if not text or any(marker in text for marker in SKIP_MARKERS):
-                continue
-
-            yield role, text
+                text = extract_text(content)
+                if not text or any(marker in text for marker in SKIP_MARKERS):
+                    continue
+                yield role, text
 
 
 def detect_format(path):
-    """Detect whether a session file is Claude Code or Codex format."""
+    """Detect whether a session file is Claude Code, Codex, or Cursor format."""
+    # Cursor transcripts live under agent-transcripts/ directories
+    if "agent-transcripts" in path:
+        return "cursor"
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         for line in f:
             line = line.strip()
@@ -101,11 +127,15 @@ def detect_format(path):
                 continue
             if entry.get("record_type") == "state":
                 return "codex"
-            if "parentUuid" in entry or "message" in entry:
+            # Claude entries have metadata fields that Cursor entries lack
+            if "parentUuid" in entry or "cwd" in entry or "timestamp" in entry:
+                return "claude"
+            if "message" in entry and set(entry.keys()) == {"role", "message"}:
+                return "cursor"
+            if "message" in entry:
                 return "claude"
             if "id" in entry and "instructions" in entry:
                 return "codex"
-            # Current Codex format uses type: "session_meta"
             if entry.get("type") == "session_meta":
                 return "codex"
     return "claude"
@@ -113,7 +143,7 @@ def detect_format(path):
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description="Pretty-print a Claude Code or Codex session transcript")
+    parser = argparse.ArgumentParser(description="Pretty-print a Claude Code, Codex, or Cursor session transcript")
     parser.add_argument("path", help="Path to a session .jsonl file")
     parser.add_argument("--pretty", action="store_true", help="Human-readable output instead of JSON")
     args = parser.parse_args()
