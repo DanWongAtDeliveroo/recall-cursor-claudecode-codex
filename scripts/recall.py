@@ -107,6 +107,34 @@ def parse_iso_timestamp(ts_str):
         return None
 
 
+# Cursor harness injects a human-readable timestamp into user turns, e.g.
+# "<timestamp>Tuesday, Apr 28, 2026, 8:28 AM (UTC+1)</timestamp>". These are the
+# only reliable signal for when a Cursor chat actually happened, since the
+# exported JSONL carries no per-entry timestamps and file mtimes get flattened
+# to the sync time. Coverage is partial (not every turn carries the tag), so the
+# caller falls back to mtime when none are found.
+CURSOR_TIMESTAMP_RE = re.compile(r"<timestamp>(.*?)</timestamp>")
+CURSOR_TIMESTAMP_OFFSET_RE = re.compile(r"\s*\(UTC([+-]\d+)?\)\s*$")
+
+
+def parse_cursor_timestamp(ts_str):
+    """Parse a Cursor harness timestamp tag value to epoch milliseconds.
+
+    Handles formats like "Tuesday, Apr 28, 2026, 8:28 AM (UTC+1)" and the
+    bare "(UTC)" variant. The UTC offset is stripped and the wall-clock time is
+    interpreted as local time, matching how mtime-derived timestamps are stored.
+    Returns None on any parse failure.
+    """
+    if not ts_str or not isinstance(ts_str, str):
+        return None
+    cleaned = CURSOR_TIMESTAMP_OFFSET_RE.sub("", ts_str.strip())
+    try:
+        dt = datetime.strptime(cleaned, "%A, %b %d, %Y, %I:%M %p")
+        return int(dt.timestamp() * 1000)
+    except (ValueError, TypeError):
+        return None
+
+
 # — Claude Code session parser —————————————————————————————————————————————
 
 def parse_claude_session(path):
@@ -319,11 +347,13 @@ def parse_codex_session(path):
 def slug_to_path(slug):
     """Convert a Cursor project directory slug back to a filesystem path.
 
-    Cursor encodes workspace paths as directory names by replacing both path
-    separators and spaces with hyphens: /Users/dan/my project -> Users-dan-my-project.
-    We resolve the ambiguity by trying the longest matching segment at each
-    position, checking for hyphens, spaces, and slashes.
+    Cursor encodes workspace paths as directory names by replacing path
+    separators, spaces, and dots with hyphens: /Users/jane.doe/my project ->
+    Users-jane-doe-my-project. We resolve the ambiguity by trying the longest
+    matching segment at each position, checking each candidate separator
+    (hyphen, space, dot) against the real filesystem.
     """
+    seps = ("-", " ", ".")
     parts = slug.split("-")
     path = ""
     i = 0
@@ -331,7 +361,7 @@ def slug_to_path(slug):
         best_j = i
         found = False
         for j in range(len(parts) - 1, i, -1):
-            for sep in ("-", " "):
+            for sep in seps:
                 candidate = path + "/" + sep.join(parts[i:j + 1])
                 if os.path.exists(candidate):
                     best_j = j
@@ -342,7 +372,7 @@ def slug_to_path(slug):
 
         if found:
             # Reconstruct with the separator that matched
-            for sep in ("-", " "):
+            for sep in seps:
                 candidate = path + "/" + sep.join(parts[i:best_j + 1])
                 if os.path.exists(candidate):
                     path = candidate
@@ -363,6 +393,7 @@ def parse_cursor_session(path):
     fpath = Path(path)
     session_id = fpath.parent.name  # UUID directory name
     messages = []
+    tag_timestamps = []  # real chat times harvested from <timestamp> tags
 
     # Derive project from the directory structure:
     # .cursor/projects/<slug>/agent-transcripts/<uuid>/<uuid>.jsonl
@@ -405,6 +436,14 @@ def parse_cursor_session(path):
                 text = extract_text(content)
                 if not text:
                     continue
+
+                # Harvest real chat times from harness-injected timestamp tags
+                # before any skip logic (these live in otherwise-skipped turns).
+                for tag in CURSOR_TIMESTAMP_RE.findall(text):
+                    ts_ms = parse_cursor_timestamp(tag)
+                    if ts_ms:
+                        tag_timestamps.append(ts_ms)
+
                 if any(marker in text for marker in CURSOR_SKIP_MARKERS):
                     continue
 
@@ -414,7 +453,14 @@ def parse_cursor_session(path):
         print(f"Warning: skipping {path}: {e}", file=sys.stderr)
         return None
 
-    date_str = time.strftime("%Y-%m-%d", time.localtime(mtime)) if timestamp else ""
+    # Prefer the earliest embedded chat timestamp (real session start). Fall back
+    # to the file mtime when no timestamp tags were present in the transcript.
+    if tag_timestamps:
+        timestamp = min(tag_timestamps)
+
+    date_str = (
+        time.strftime("%Y-%m-%d", time.localtime(timestamp / 1000)) if timestamp else ""
+    )
     slug = f"{date_str}-{session_id[:8]}" if date_str else session_id[:12]
 
     metadata = {
@@ -538,7 +584,10 @@ def search(conn, query, project=None, days=None, source=None, limit=10):
     if project or days or source:
         subconds = []
         if project:
-            subconds.append("s2.project LIKE ? || '%'")
+            # Substring match so a bare directory name (e.g. "chief-of-staff")
+            # matches an absolute project path, as documented. A full path
+            # prefix is a substring too, so this stays backward compatible.
+            subconds.append("s2.project LIKE '%' || ? || '%'")
             fts_params.append(project)
         if days:
             cutoff = int((time.time() - days * 86400) * 1000)
